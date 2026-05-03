@@ -1,0 +1,140 @@
+name: XFCE RDP + Tailscale + n8n (Full Automation)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    env:
+      TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+      USERNAME: runner
+      PASSWORD: runner
+      TAILSCALE_HOSTNAME: xfce-n8n-${{ github.run_id }}
+      N8N_PORT: 5678
+      N8N_DATA: /home/runner/n8n_data
+      WORKFLOWS_REPO: https://github.com/Zie619/n8n-workflows.git
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---------- RDP (XFCE) ----------
+      - name: Set user password and sudo
+        run: |
+          echo "${USERNAME}:${PASSWORD}" | sudo chpasswd
+          echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/${USERNAME}
+
+      - name: Install XFCE Desktop + xrdp
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq xfce4 xfce4-goodies xorg dbus-x11 xrdp
+          echo "startxfce4" | sudo tee /home/${USERNAME}/.xsession
+          sudo chown ${USERNAME}:${USERNAME} /home/${USERNAME}/.xsession
+          sudo systemctl enable --now xrdp
+          sudo systemctl restart xrdp
+
+      # ---------- Tailscale ----------
+      - name: Install Tailscale
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sudo sh
+          sudo tailscale up --authkey "${TAILSCALE_AUTHKEY}" --hostname "${TAILSCALE_HOSTNAME}"
+
+      # ---------- Docker ----------
+      - name: Install Docker
+        run: |
+          curl -fsSL https://get.docker.com | sudo sh
+          sudo usermod -aG docker ${USERNAME}
+          sudo systemctl start docker
+          docker compose version
+
+      - name: Deploy n8n with PostgreSQL (using 'docker compose')
+        run: |
+          sudo mkdir -p ${N8N_DATA}/postgres_data
+          sudo chown -R 1000:1000 ${N8N_DATA}
+          sudo chmod -R 755 ${N8N_DATA}
+
+          cat <<EOF > docker-compose-n8n.yml
+          version: '3.8'
+          services:
+            postgres:
+              image: postgres:15
+              restart: unless-stopped
+              environment:
+                - POSTGRES_USER=n8n
+                - POSTGRES_PASSWORD=n8n
+                - POSTGRES_DB=n8n
+              volumes:
+                - ${N8N_DATA}/postgres_data:/var/lib/postgresql/data
+              healthcheck:
+                test: ["CMD-SHELL", "pg_isready -U n8n"]
+                interval: 10s
+                timeout: 5s
+                retries: 5
+            n8n:
+              image: n8nio/n8n:latest
+              restart: unless-stopped
+              ports:
+                - "${N8N_PORT}:5678"
+              environment:
+                - N8N_HOST=0.0.0.0
+                - N8N_PORT=5678
+                - N8N_PROTOCOL=http
+                - NODE_ENV=production
+                - DB_TYPE=postgresdb
+                - DB_POSTGRESDB_HOST=postgres
+                - DB_POSTGRESDB_PORT=5432
+                - DB_POSTGRESDB_DATABASE=n8n
+                - DB_POSTGRESDB_USER=n8n
+                - DB_POSTGRESDB_PASSWORD=n8n
+                - WEBHOOK_URL=http://localhost:${N8N_PORT}
+              volumes:
+                - ${N8N_DATA}/n8n_data:/home/node/.n8n
+              depends_on:
+                postgres:
+                  condition: service_healthy
+          EOF
+
+          docker compose -f docker-compose-n8n.yml up -d
+
+          echo "Waiting for n8n to start..."
+          for i in {1..30}; do
+            if curl -s -f -o /dev/null http://localhost:${N8N_PORT}/healthz; then
+              echo "✓ n8n is ready"
+              break
+            fi
+            sleep 5
+          done
+
+      - name: Clone Zie619 n8n-workflows repository (with sudo fix)
+        run: |
+          git clone --depth 1 ${WORKFLOWS_REPO} /tmp/n8n-workflows
+          sudo mkdir -p ${N8N_DATA}/workflows
+          sudo cp -r /tmp/n8n-workflows/* ${N8N_DATA}/workflows/
+          sudo chown -R ${USERNAME}:${USERNAME} ${N8N_DATA}/workflows
+          echo "Workflows are now stored in ${N8N_DATA}/workflows/"
+
+      - name: Connection Information
+        run: |
+          TS_IP=$(sudo tailscale ip -4 | head -n1 | tr -d ' ')
+          echo "============================================================"
+          echo "    XFCE RDP + TAILSCALE + N8N (Full Automation) READY     "
+          echo "============================================================"
+          echo "RDP Address: ${TS_IP}:3389"
+          echo "Username: ${USERNAME}"
+          echo "Password: ${PASSWORD}"
+          echo ""
+          echo "n8n URL: http://${TS_IP}:${N8N_PORT}"
+          echo "  - First visit: Create admin account"
+          echo ""
+          echo "Workflows are stored in: ${N8N_DATA}/workflows/"
+          echo "You can import them manually from the n8n UI:"
+          echo "   Settings → Workflows → Import from File"
+          echo ""
+          echo "The repository contains 4,000+ workflows organized by category."
+          echo "============================================================"
+
+      - name: Keep Runner Alive
+        run: while true; do sleep 600; done
