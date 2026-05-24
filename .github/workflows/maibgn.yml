@@ -1,0 +1,114 @@
+name: Setup SSH Runner + Open WebUI + Ollama with Gemma 3
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  setup-ssh-runner:
+    runs-on: ubuntu-latest
+    env:
+      TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+      USERNAME: runner
+      PASSWORD: runner
+      TAILSCALE_HOSTNAME: gh-ssh-${{ github.run_id }}
+      OPENWEBUI_PORT: 3000
+      OLLAMA_PORT: 11434
+      GEMMA_MODEL: gemma3:12b   # or gemma3:4b, gemma2:9b, etc.
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure runner user has sudo + password
+        run: |
+          echo "${USERNAME}:${PASSWORD}" | sudo chpasswd
+          echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/${USERNAME}
+
+      - name: Install OpenSSH server
+        run: |
+          echo ">>> Installing OpenSSH..."
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq openssh-server
+          sudo systemctl enable ssh
+          sudo systemctl restart ssh
+
+      - name: Install Tailscale
+        run: |
+          echo ">>> Installing Tailscale..."
+          curl -fsSL https://tailscale.com/install.sh | sudo sh
+          sudo tailscale up --authkey "${TAILSCALE_AUTHKEY}" --hostname "${TAILSCALE_HOSTNAME}"
+
+      - name: Install Docker and Docker Compose
+        run: |
+          echo ">>> Installing Docker..."
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ca-certificates curl
+          sudo install -m 0755 -d /etc/apt/keyrings
+          sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+          sudo chmod a+r /etc/apt/keyrings/docker.asc
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+          sudo usermod -aG docker ${USERNAME}
+
+      - name: Install Ollama
+        run: |
+          echo ">>> Installing Ollama..."
+          curl -fsSL https://ollama.com/install.sh | sh
+          # Start Ollama service
+          sudo systemctl enable ollama
+          sudo systemctl start ollama
+          # Wait for Ollama to be ready
+          sleep 5
+
+      - name: Pull Gemma 3 model
+        run: |
+          echo ">>> Pulling ${GEMMA_MODEL} model (this may take 5-10 minutes)..."
+          ollama pull ${GEMMA_MODEL}
+          echo "✅ Model pulled successfully"
+
+      - name: Run Open WebUI container (connected to local Ollama)
+        run: |
+          echo ">>> Pulling Open WebUI image..."
+          docker pull ghcr.io/open-webui/open-webui:main
+          
+          echo ">>> Starting Open WebUI on port ${OPENWEBUI_PORT}..."
+          docker run -d \
+            --name open-webui \
+            --restart always \
+            -p ${OPENWEBUI_PORT}:8080 \
+            -e OLLAMA_BASE_URL="http://host.docker.internal:${OLLAMA_PORT}" \
+            -v open-webui-data:/app/backend/data \
+            --add-host host.docker.internal:host-gateway \
+            ghcr.io/open-webui/open-webui:main
+
+      - name: Show Access Information
+        run: |
+          TAILSCALE_IP=$(tailscale ip -4 | head -n1)
+          echo "=========================================="
+          echo "✅ SSH Runner is ready"
+          echo "=========================================="
+          echo "🔹 SSH Access:"
+          echo "   ssh -o StrictHostKeyChecking=no ${USERNAME}@${TAILSCALE_IP}"
+          echo "   Password: ${PASSWORD}"
+          echo ""
+          echo "🔹 Open WebUI Access:"
+          echo "   http://${TAILSCALE_IP}:${OPENWEBUI_PORT}"
+          echo "   (First visit: create admin account)"
+          echo ""
+          echo "🔹 Ollama (local) + Gemma Model:"
+          echo "   Model: ${GEMMA_MODEL}"
+          echo "   Ollama API: http://${TAILSCALE_IP}:${OLLAMA_PORT}"
+          echo ""
+          echo "   Test Gemma via command line on runner:"
+          echo "   ollama run ${GEMMA_MODEL} 'Hello, explain AI briefly'"
+          echo ""
+          echo "=========================================="
+          echo "This runner is provided by @MR_English2008 on Telegram."
+          echo "For more methods, join: https://t.me/ME2008_RDP"
+          echo "=========================================="
+          echo ""
+          echo ">>> Keeping runner alive..."
+          tail -f /dev/null
